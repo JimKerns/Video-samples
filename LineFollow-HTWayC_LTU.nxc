@@ -1,0 +1,606 @@
+//=====================================================================
+//  Modified for line following  - default assumes white line on black
+//      background. Turn left if sensor is dark (low value), right if sensor is
+//      high (100) - start robot to the right of the white line... JMK
+//  deleted remote sensor for wireless control. Added ultrasonic sensor to
+//  stop if obstical detected. JMK
+//
+//
+// HiTechnic HTWay Version 1.1
+// Copyright (c) 2010 HiTechnic
+//
+// Revision History
+//   1.1    Fixed a bug that prevented the HTWayC program from working
+//          correctly when optimization level was set to 2.
+//          Also imporived the accuracy of the initial gyro offset
+//          caluculation by ensuring the motor controller in active.
+//
+// Gyro based sample Segway type robot. This NXC program uses the LEGO
+// 2.0 firmware which has floating point support.  It has been tested
+// with LEGO NXT firmware 1.29.
+//
+// To use the floating point math available in the 2.0 firmware,
+// BricxCC must be setup to tell the compiler to target that firmware.
+// From the Edit menu, select Preferences.  Select the Compiler tab,
+// and then NBC/NXC sub-tab and check 'NXT 2.0 compatible firmware.'
+
+// LTU Kit information - wheel track 6.75inches, wheel diameter 2.1 inches.
+// 36 inches = 5 wheel rotations JMK
+
+// Port Input and Output
+#define GYRO         IN_1
+//#define IR_RECEIVER  IN_4 Replace with sonic distance sensor JMK
+#define ULTRASONIC_SENSOR IN_4
+#define LEFT_MOTOR   OUT_C
+#define RIGHT_MOTOR  OUT_A
+#define MOTORS       OUT_AC
+#define LIGHT_SENSE IN_3
+
+//=====================================================================
+// Balancing constants
+//
+// These are the constants used to maintain balance.
+//
+// Loop wait time.  WAIT_TIME is the time in ms passed to the
+// Wait command.
+#define WAIT_TIME    8
+
+// Wheel ratio is relative size compared to NXT 1.0 wheels
+// For the NXT 1.0 wheels (56x26) use:           1.0
+// For the NXT 2.0 wheels (43.2x22) use:         0.7
+// For the big white RCX wheels (81.6x15) use:   1.4
+#define WHEEL_RATIO_NXT1 1.0
+#define WHEEL_RATIO_NXT2 0.8  /* these are the LTU wheels JMK */
+#define WHEEL_RATIO_RCX  1.4
+
+// These are the main four balance constants, only the gyro
+// constants are relative to the wheel size.  KPOS and KSPEED
+// are self-relative to the wheel size.
+#define KGYROANGLE  7.5
+#define KGYROSPEED  1.15
+#define KPOS        0.07
+#define KSPEED      0.1
+
+// This constant aids in drive control.  When the robot starts
+// moving because of user control, this constant helps get the
+// robot leaning in the right direction.  Similarly, it helps
+// bring robot to a stop when stopping.
+#define KDRIVE      -0.02
+
+// Power differential used for steering based on difference of
+// target steering and actual motor difference.
+#define KSTEER      0.25
+
+// Gyro offset control
+// The gyro sensor will drift with time.  This constant is used in a
+// simple long term averaging to adjust for this drift.
+// Every time through the loop, the current gyro sensor value is
+// averaged into the gyro offset weighted according to this constant.
+#define EMAOFFSET 0.0005
+
+// If robot power is saturated (over +/- 100) for over this time limit
+// then robot must have fallen.  In milliseconds.
+#define TIME_FALL_LIMIT     1000
+
+//---------------------------------------------------------------------
+// IR Control constants
+#define CONTROL_WAIT 25
+
+// To use a different IR channel, chage these constants not using this sensor JMK
+//#define IR_LEFT           HT_CH1_A
+//#define IR_RIGHT          HT_CH1_B
+
+// This constant is in degrees/second for maximum speed.  Note that
+// position and speed are measured as the sum of the two motors, in
+// other words, 600 would actually be 300 degrees/second for each
+// motor.
+#define CONTROL_SPEED  600.0
+
+//=====================================================================
+// Global variables
+//
+// These variables are used to control the movement of the robot.  Both
+// are in degrees/second.
+//
+// motorControlDrive is the target speed for the sum of the two motors
+// while motorControlSteer is the target change in difference for two motors.
+float motorControlDrive = 0.0;
+float motorControlSteer = 0.0;
+
+// This global contains the target motor differential, essentially,
+// which way the robot should be pointing.  This value is
+// updated every time through the balance loop based on motorControlSteer
+float motorDiffTarget = 0.0;
+
+// Time that robot first starts to balance.  Used to calculate tInterval
+long tCalcStart;
+
+// tInterval is the time, in seconds, for each iteration of the
+// balance loop.
+float tInterval;
+
+// ratioWheel stores the relative wheel size compared to a standard NXT
+// 1.0 wheel.  RCX 2.0 wheel has ratio of 0.7 while large RCX wheel is 1.4
+float ratioWheel;
+
+// Gyro globals
+float gOffset;
+float gAngleGlobal = 0;
+
+// Motor globals
+float motorPos = 0;
+long mrcSum = 0, mrcSumPrev;
+long motorDiff;
+long mrcDeltaP3 = 0;
+long mrcDeltaP2 = 0;
+long mrcDeltaP1 = 0;
+
+// Robot will run "open loop" in a figure 8 JMK
+float RADIUS = 36.0;
+// units in inches for the moment
+float TRACK = 6.75;
+float SpeedRatio = 0;
+float SpeedDelta = 0;
+float DegPerCircle = 0.0;
+// Minimum distance to an obstruction cm (I think)
+float MIN_DISTANCE = 30;
+#define NOM_SPEED 400    // too fast and it falls
+float ObjectDistance = 0;
+
+#define LIGHT_TARGET 320    //Target light sensor value for black table with white line
+                           // about 350 passive, 420 active
+                           // in the robotics lab JMK
+#define KPTRACKING 2.2  // proportional gain for line following mode
+#define KITRACKING 0.0  // Integral gain for line following mode
+#define KDTRACKING 0.0  // Derivitive gain for line following mode
+#define FCTRACKING 0.6  // filter constant for derivitive gain
+float LightSignal = 0; //current reflected light value
+float LightSignalBar = 0; // filtered value of light signal
+float LightSignalPrev = 0.0;  // previous value of filtered light signal
+float LightSignalDeriv = 0.0; // detivitive correction
+float LightSignalInt = 0.0;   // Intergral correction
+float LightSignalErr = 0.0;   // error term
+
+
+//=====================================================================
+// void SetWheelRatio()
+//
+// This function implements a UI so that the user can choose the
+// size of the wheels used on the robot.
+void SetWheelRatio()
+{
+  int nSelect;
+
+  // Start of with Medium (NXT 1.0) selected  Change to 2 JMK
+  nSelect = 1;
+
+  do {
+    // Display base text of user interface on screen
+    ClearScreen();
+    TextOut(0, LCD_LINE1, "HiTechnic-HTWayC");
+    TextOut(6, LCD_LINE2, "Set wheel size:");
+    TextOut(2, LCD_LINE8, "<   [Select]   >");
+
+    // Display current selection
+    switch (nSelect) {
+    case 1:
+      // Small
+      CircleOut(50, 32, 6);
+      TextOut(7, LCD_LINE7, "Small (NXT 2.0)");
+      ratioWheel = WHEEL_RATIO_NXT2;
+      break;
+    case 2:
+      // Medium
+      CircleOut(50, 32, 10);
+      TextOut(2, LCD_LINE7, "Medium (NXT 1.0)");
+      ratioWheel = WHEEL_RATIO_NXT1;
+      break;
+    case 3:
+      // Large
+      CircleOut(50, 32, 14);
+      TextOut(17, LCD_LINE7, "Large (RCX)");
+      ratioWheel = WHEEL_RATIO_RCX;
+      break;
+    }
+
+    // Make sure previous button is released, loop until all released
+    while(ButtonPressed(BTNLEFT, false) ||
+          ButtonPressed(BTNCENTER, false) ||
+          ButtonPressed(BTNRIGHT, false));
+
+    // Get button press
+    while(true) {
+      if (ButtonPressed(BTNLEFT, false)) {
+        nSelect--;
+        if (nSelect < 1) nSelect = 3;
+        break;
+      }
+      if (ButtonPressed(BTNRIGHT, false)) {
+        nSelect++;
+        if (nSelect > 3) nSelect = 1;
+        break;
+      }
+      if (ButtonPressed(BTNCENTER, false))
+        break;
+    }
+  } until (ButtonPressed(BTNCENTER, false));
+  ClearScreen();
+}
+
+//=====================================================================
+// GetGyroOffset
+//
+// This function returns a suitable initial gyro offset.  It takes
+// 100 gyro samples over a time of 1/2 second and averages them to
+// get the offset.  It also check the max and min during that time
+// and if the difference is larger than one it rejects the data and
+// gets another set of samples.
+#define OFFSET_SAMPLES 100
+
+void GetGyroOffset()
+{
+  float gSum;
+  int  i, gMin, gMax, g;
+
+  ClearScreen();
+  TextOut(0, LCD_LINE1, "HiTechnic-HTWayC");
+
+  TextOut(0, LCD_LINE4, "Lay robot down");
+  TextOut(0, LCD_LINE5, "flat to get gyro");
+  TextOut(0, LCD_LINE6, "offset.");
+  
+  // Ensure that the motor controller is active since this affects
+  // the gyro values.
+  Off(MOTORS);
+  
+  do {
+    gSum = 0.0;
+    gMin = 1000;
+    gMax = -1000;
+    for (i=0; i<OFFSET_SAMPLES; i++) {
+      g = SensorHTGyro(GYRO);
+
+      if (g > gMax)
+        gMax = g;
+      if (g < gMin)
+        gMin = g;
+
+      gSum += g;
+      Wait(5);
+    }
+  } while ((gMax - gMin) > 1);   // Reject and sample again if range too large
+
+  //Average the sum of the samples.
+  gOffset = gSum / OFFSET_SAMPLES + 1.0;
+  
+  // Even with motor controller active, the initial offset appears to
+  // be off from the actual needed offset to keep robot from wondering.
+  // This +1 helps keep robot from wondering when it first starts to
+  // balance.
+}
+
+//=====================================================================
+void StartBeeps()
+{
+  int c;
+
+  ClearScreen();
+  TextOut(0, LCD_LINE1, "HiTechnic-HTWayC");
+
+  TextOut(20, LCD_LINE3, "Balance in");
+
+  // Play warning beep sequence to indicate balance about to start
+  for (c=5; c>0;c--) {
+    NumOut(47, LCD_LINE4, c);
+    PlayTone(440,100);
+    Wait(1000);
+  }
+  NumOut(47, LCD_LINE4, 0);
+  PlayTone(440,1000);
+  Wait(1000);
+  LightSignalBar = SensorNormalized(LIGHT_SENSE);    // initialize filtered value
+}
+
+//=====================================================================
+// task main - initializes the sensors, Both taskBalance and
+// taskController start when main ends.
+task main()
+{
+  // Initialize the sensors
+  SetSensorHTGyro(GYRO);
+  SetSensorUltrasonic(ULTRASONIC_SENSOR);
+  // need to define units here - JMK
+  
+    // set sensor type and mode
+  SetSensorType(LIGHT_SENSE, IN_TYPE_LIGHT_ACTIVE);
+ // SetSensorType(LIGHT_SENSE, IN_TYPE_LIGHT_INACTIVE);
+  SetSensorMode(LIGHT_SENSE, IN_MODE_PCTFULLSCALE);
+
+
+  //  SetSensorLowspeed(IR_RECEIVER);
+  Wait(50);
+
+   // calculate degrees per one circle
+  DegPerCircle = 360*(5.0 / 36.0)*(2.0*3.14)*RADIUS ;
+  // 5 rotations per 36 inches
+
+  // calculate motor speed difference for target radius JMK
+  SpeedRatio = RADIUS/(RADIUS + (TRACK/2));
+  SpeedDelta = 360*(5.0 / 36.0)*(2.0*3.14)*(TRACK);
+
+  // Get user input on wheel size
+  SetWheelRatio();
+
+  // Get the initial gyro offset
+  GetGyroOffset();
+
+  // Play warning beep sequence before balance starts
+  StartBeeps();
+
+  // When task main ends, both taskBalance and taskControl will start
+}
+
+//=====================================================================
+// GetGyroData(float &gyroSpeed, float &gyroAngle)
+//
+// Get the data from the gyro.
+// Fills the pass by reference gyroSpeed and gyroAngle based on
+// updated information from the Gyro Sensor
+//
+// Maintains an automatically adjusted gyro offset as well as
+// the integrated gyro angle.
+inline void GetGyroData(float &gyroSpeed, float &gyroAngle)
+{
+  float gyroRaw;
+
+  gyroRaw = SensorHTGyro(GYRO);
+  gOffset = EMAOFFSET * gyroRaw + (1-EMAOFFSET) * gOffset;
+  gyroSpeed = gyroRaw - gOffset;
+
+  gAngleGlobal += gyroSpeed*tInterval;
+  gyroAngle = gAngleGlobal;
+}
+
+//---------------------------------------------------------------------
+
+inline void GetMotorData(float &motorSpeed, float &motorPos)
+{
+  long mrcLeft, mrcRight, mrcDelta;
+
+  // Keep track of motor position and speed
+  mrcLeft = MotorRotationCount(LEFT_MOTOR);
+  mrcRight = MotorRotationCount(RIGHT_MOTOR);
+
+  // Maintain previus mrcSum so that delta can be calculated and get
+  // new mrcSum and Diff values
+  mrcSumPrev = mrcSum;
+  mrcSum = mrcLeft + mrcRight;
+  motorDiff = mrcLeft - mrcRight;
+
+  // mrcDetla is the change int sum of the motor encoders, update
+  // motorPos based on this detla
+  mrcDelta = mrcSum - mrcSumPrev;
+  motorPos += mrcDelta;
+
+  // motorSpeed is based on the average of the last four delta's.
+  motorSpeed = (mrcDelta+mrcDeltaP1+mrcDeltaP2+mrcDeltaP3)/(4*tInterval);
+
+  // Shift the latest mrcDelta into the previous three saved delta values
+  mrcDeltaP3 = mrcDeltaP2;
+  mrcDeltaP2 = mrcDeltaP1;
+  mrcDeltaP1 = mrcDelta;
+}
+
+//---------------------------------------------------------------------
+// void SteerControl(int power, int &powerLeft, int &powerRight)
+//
+// This function determines the left and right motor power that should
+// be used based on the balance power and the steering control
+inline void SteerControl(int power, int &powerLeft, int &powerRight)
+{
+  int powerSteer;
+
+  // Update the target motor difference based on the user steering
+  // control value.
+  motorDiffTarget += motorControlSteer * tInterval;
+
+  // Determine the proportionate power differential to be used based
+  // on the difference between the target motor difference and the
+  // actual motor difference.
+  powerSteer = KSTEER * (motorDiffTarget - motorDiff);
+
+  // Apply the power steering value with the main power value to
+  // get the left and right power values.
+  powerLeft = power + powerSteer;
+  powerRight = power - powerSteer;
+
+  // Limit the power to motor power range -100 to 100
+  if (powerLeft > 100)   powerLeft = 100;
+  if (powerLeft < -100)  powerLeft = -100;
+
+  // Limit the power to motor power range -100 to 100
+  if (powerRight > 100)  powerRight = 100;
+  if (powerRight < -100) powerRight = -100;
+}
+
+//---------------------------------------------------------------------
+// void CalcInterval(long cLoop)
+//
+// Calculate the interval time from one iteration of the loop to the next.
+// Note that first time through, cLoop is 0, and has not gone through
+// the body of the loop yet.  Use it to save the start time.
+// After the first iteration, take the average time and convert it to
+// seconds for use as interval time.
+inline void CalcInterval(long cLoop)
+{
+  if (cLoop == 0) {
+    // First time through, set an initial tInterval time and
+    // record start time
+    tInterval = 0.0055;
+    tCalcStart = CurrentTick();
+  } else {
+    // Take average of number of times through the loop and
+    // use for interval time.
+    tInterval = (CurrentTick() - tCalcStart)/(cLoop*1000.0);
+  }
+}
+
+//---------------------------------------------------------------------
+// taskBalance
+// This is the main balance task for the HTWay robot.
+//
+// Robot is assumed to start leaning on a wall.  The first thing it
+// does is take multiple samples of the gyro sensor to establish and
+// initial gyro offset.
+//
+// After an initial gyro offset is established, the robot backs up
+// against the wall until it falls forward, when it detects the
+// forward fall, it start the balance loop.
+//
+// The main state variables are:
+// gyroAngle  This is the angle of the robot, it is the results of
+//            integrating on the gyro value.
+//            Units: degrees
+// gyroSpeed  The value from the Gyro Sensor after offset subtracted
+//            Units: degrees/second
+// motorPos   This is the motor position used for balancing.
+//            Note that this variable has two sources of input:
+//             Change in motor position based on the sum of
+//             MotorRotationCount of the two motors,
+//            and,
+//             forced movement based on user driving the robot.
+//            Units: degrees (sum of the two motors)
+// motorSpeed This is the speed of the wheels of the robot based on the
+//            motor encoders.
+//            Units: degrees/second (sum of the two motors)
+//
+// From these state variables, the power to the motors is determined
+// by this linear equation:
+//     power = KGYROSPEED * gyro +
+//             KGYROANGLE * gyroAngle +
+//             KPOS       * motorPos +
+//             KSPEED     * motorSpeed;
+//
+task taskBalance()
+{
+  Follows(main);
+
+  float gyroSpeed, gyroAngle;
+  float motorSpeed;
+
+  int power, powerLeft, powerRight;
+  long tMotorPosOK;
+  long cLoop = 0;
+
+  ClearScreen();
+  TextOut(0, LCD_LINE1, "HiTechnic-HTWayC");
+  TextOut(0, LCD_LINE4, "Balancing");
+
+  tMotorPosOK = CurrentTick();
+
+  // Reset the motors to make sure we start at a zero position
+  ResetRotationCount(LEFT_MOTOR);
+  ResetRotationCount(RIGHT_MOTOR);
+
+  while(true) {
+     CalcInterval(cLoop++);
+
+     GetGyroData(gyroSpeed, gyroAngle);
+
+     GetMotorData(motorSpeed, motorPos);
+
+     // Apply the drive control value to the motor position to get robot
+     // to move.
+     motorPos -= motorControlDrive * tInterval;
+
+     // This is the main balancing equation
+     power = (KGYROSPEED * gyroSpeed +               // Deg/Sec from Gyro sensor
+              KGYROANGLE * gyroAngle) / ratioWheel + // Deg from integral of gyro
+             KPOS       * motorPos +                 // From MotorRotaionCount of both motors
+             KDRIVE     * motorControlDrive +        // To improve start/stop performance
+             KSPEED     * motorSpeed;                // Motor speed in Deg/Sec
+
+     if (abs(power) < 100)
+       tMotorPosOK = CurrentTick();
+
+     SteerControl(power, powerLeft, powerRight);
+
+     // Apply the power values to the motors
+     OnFwd(LEFT_MOTOR, powerLeft);
+     OnFwd(RIGHT_MOTOR, powerRight);
+
+     // Check if robot has fallen by detecting that motorPos is being limited
+     // for an extended amount of time.
+     if ((CurrentTick() - tMotorPosOK) > TIME_FALL_LIMIT) {
+       break;
+     }
+
+     Wait(WAIT_TIME);
+  }
+  Off(MOTORS);
+
+  TextOut(0, LCD_LINE4, "Oops... I fell");
+
+  TextOut(0, LCD_LINE8, "tInt ms:");
+  NumOut(6*8, LCD_LINE8, tInterval*1000);
+}
+
+//=====================================================================
+// taskControl
+// This task runs in parallel to taskBalance.  This task monitors
+// the optical and ultrasonic sensors and sets the global variables motorControlDrive
+// and motorControlSteer.  Both of these values are in degrees/second.
+//
+task taskControl()
+{
+  Follows(main);
+
+  char pfData[8];
+
+
+  while(true) {
+  
+     LightSignal = SensorNormalized(LIGHT_SENSE);
+     LightSignalPrev = LightSignalBar;
+     // calculate filtered value of light signal for Deriv. control.
+     LightSignalBar = FCTRACKING*LightSignal + (1.0-FCTRACKING)* LightSignalBar;
+     
+     // derivitive of light signal
+     LightSignalDeriv = KDTRACKING*(LightSignalBar - LightSignalPrev);
+     LightSignalErr =  (LightSignal - LIGHT_TARGET);
+     LightSignalInt +=  KITRACKING*LightSignalErr;
+     
+      NumOut(50, LCD_LINE6, LightSignal);
+      
+    // change over to use ultrasonic sensor for object detection
+    // stop when object detected - later on we can add u turn after timeout
+    // JMK
+     ObjectDistance = SensorUS(ULTRASONIC_SENSOR);
+
+    if (ObjectDistance < MIN_DISTANCE) {
+    // stop here.
+        motorControlDrive = 0;
+        motorControlSteer = 0;
+         }
+       else {
+    // Set control Drive and Steer.  These are in motor degree/second
+    // KPTRACKING  proportional gain for line following mode
+    // KITRACKING  Integral gain for line following mode
+    // KDTRACKING  Derivitive gain for line following mode
+    // FCTRACKING  filter constant for derivitive gain
+
+
+    motorControlDrive = NOM_SPEED;
+    motorControlSteer = (KPTRACKING * LightSignalErr )+ LightSignalDeriv + LightSignalInt
+                         ;
+    // Turn left if the intensity is too low, right if it is too high.
+         }
+
+
+
+    //Wait(CONTROL_WAIT);
+  }
+  // Wait to allow user time to see screen.
+  Wait(10000);
+}
+
